@@ -20,6 +20,9 @@ SHEET_NAME = "Campi RPF"
 MAX_FIELD_NUMBER = 20
 DEFAULT_MAX_IMPORT_FIELD = 12
 NON_IMPORTABLE_RECORDS = frozenset({10, 11})
+# Se True, i campi aggiunti in importazione vengono scritti in nuovi record C.
+SEPARATI = True
+
 NUMERIC_VALUE = re.compile(r"^[+-]?\d+(?:,\d+)?$")
 
 
@@ -214,7 +217,45 @@ def insert_rb_chunk(
     )
 
 
-def repack_c_modules(lines: list[str], modules: dict[int, dict[str, object]]) -> list[str]:
+def remove_preexisting_rb_chunks(
+    modules: dict[int, dict[str, object]], record_prefix: str
+) -> None:
+    """Conserva solo i campi importati nei record C aggiunti."""
+    pattern = re.compile(
+        rf"^{re.escape(record_prefix)}(?P<record>\d{{3}})(?P<field>\d{{3}})$"
+    )
+    for info in modules.values():
+        chunks = info["chunks"]
+        chunks[:] = [
+            chunk
+            for chunk in chunks
+            if (
+                (match := pattern.fullmatch(str(chunk["code"]))) is None
+                or int(match["record"]) in NON_IMPORTABLE_RECORDS
+                or int(chunk["source_line"]) == 0
+            )
+        ]
+
+
+def fixed_length_lines(lines: list[str]) -> list[str]:
+    """Normalizza le righe RPF alla lunghezza prescritta di 1900 caratteri."""
+    normalized: list[str] = []
+    for line_number, line in enumerate(lines, start=1):
+        body, _ending = _split_line_ending(line)
+        if len(body) != C_BODY_LENGTH:
+            raise RpfError(
+                f"La riga {line_number} e' lunga {len(body)} caratteri; "
+                f"ne sono attesi {C_BODY_LENGTH} prima di CR/LF."
+            )
+        normalized.append(body + "\r\n")
+    return normalized
+
+
+def repack_c_modules(
+    lines: list[str],
+    modules: dict[int, dict[str, object]],
+    separate_insertions: bool | None = None,
+) -> list[str]:
     """Ricostruisce i record C per modulo, creando record C aggiuntivi se necessari.
 
     Ogni record C conserva 89 caratteri posizionali, 75 coppie codice/valore da
@@ -222,22 +263,55 @@ def repack_c_modules(lines: list[str], modules: dict[int, dict[str, object]]) ->
     lo stesso Progressivo modulo e sono inseriti subito dopo l'ultimo record C
     di quel modulo. Il conteggio dei record C nel record Z viene aggiornato.
     """
+    if separate_insertions is None:
+        separate_insertions = SEPARATI
+
     replacements: dict[int, str] = {}
     additions_after: dict[int, list[str]] = {}
+    removed_indexes: set[int] = set()
     total_c_records = 0
 
     for module, info in modules.items():
         line_indexes: list[int] = list(info["line_indexes"])
         templates: list[tuple[str, str]] = list(info["templates"])
         chunks: list[dict[str, object]] = list(info["chunks"])
-        needed = max(1, (len(chunks) + C_CHUNKS_PER_RECORD - 1) // C_CHUNKS_PER_RECORD)
-        record_count = max(len(line_indexes), needed)
+        if separate_insertions:
+            chunks_by_line = {
+                line_index: [
+                    chunk for chunk in chunks if int(chunk["source_line"]) == line_index + 1
+                ]
+                for line_index in line_indexes
+            }
+            existing_line_indexes = [
+                line_index for line_index in line_indexes if chunks_by_line[line_index]
+            ]
+            removed_indexes.update(set(line_indexes) - set(existing_line_indexes))
+            inserted_chunks = sorted(
+                (chunk for chunk in chunks if int(chunk["source_line"]) == 0),
+                key=lambda chunk: str(chunk["code"]),
+            )
+            record_count = len(existing_line_indexes) + (
+                len(inserted_chunks) + C_CHUNKS_PER_RECORD - 1
+            ) // C_CHUNKS_PER_RECORD
+        else:
+            needed = max(1, (len(chunks) + C_CHUNKS_PER_RECORD - 1) // C_CHUNKS_PER_RECORD)
+            record_count = max(len(line_indexes), needed)
         total_c_records += record_count
 
         for record_no in range(record_count):
-            template_body, template_ending = templates[min(record_no, len(templates) - 1)]
-            start = record_no * C_CHUNKS_PER_RECORD
-            selected = chunks[start : start + C_CHUNKS_PER_RECORD]
+            if separate_insertions:
+                if record_no < len(existing_line_indexes):
+                    line_index = existing_line_indexes[record_no]
+                    template_body, template_ending = templates[line_indexes.index(line_index)]
+                    selected = chunks_by_line[line_index]
+                else:
+                    template_body, template_ending = templates[-1]
+                    start = (record_no - len(existing_line_indexes)) * C_CHUNKS_PER_RECORD
+                    selected = inserted_chunks[start : start + C_CHUNKS_PER_RECORD]
+            else:
+                template_body, template_ending = templates[min(record_no, len(templates) - 1)]
+                start = record_no * C_CHUNKS_PER_RECORD
+                selected = chunks[start : start + C_CHUNKS_PER_RECORD]
             payload = "".join(str(c["code"]) + str(c["value"]) for c in selected)
             payload = payload.ljust(C_PAYLOAD_LENGTH)
             new_body = (
@@ -246,13 +320,18 @@ def repack_c_modules(lines: list[str], modules: dict[int, dict[str, object]]) ->
                 + template_body[C_PAYLOAD_END:]
             )
             new_line = new_body + template_ending
-            if record_no < len(line_indexes):
+            if separate_insertions and record_no < len(existing_line_indexes):
+                replacements[existing_line_indexes[record_no]] = new_line
+            elif not separate_insertions and record_no < len(line_indexes):
                 replacements[line_indexes[record_no]] = new_line
             else:
                 additions_after.setdefault(line_indexes[-1], []).append(new_line)
 
     rebuilt: list[str] = []
     for line_index, line in enumerate(lines):
+        if line_index in removed_indexes:
+            rebuilt.extend(additions_after.get(line_index, []))
+            continue
         current = replacements.get(line_index, line)
         rebuilt.append(current)
         rebuilt.extend(additions_after.get(line_index, []))
@@ -266,7 +345,7 @@ def repack_c_modules(lines: list[str], modules: dict[int, dict[str, object]]) ->
         raise RpfError("Il record Z non ha la lunghezza prevista di 1898 caratteri prima di CR/LF.")
     z_body = z_body[:Z_C_COUNT_START] + f"{total_c_records:09d}" + z_body[Z_C_COUNT_END:]
     rebuilt[z_index] = z_body + z_ending
-    return rebuilt
+    return fixed_length_lines(rebuilt) if separate_insertions else rebuilt
 
 
 def is_numeric_field(value: str) -> bool:
@@ -533,6 +612,8 @@ def import_excel(
             new_text = value_for_rpf(cell_value)
             if chunk_index is not None:
                 previous = chunks[chunk_index]["value"]
+                if SEPARATI:
+                    chunks[chunk_index]["source_line"] = 0
                 formatted = (
                     previous
                     if is_numeric_field(previous) and has_same_numeric_value(new_text, previous)
@@ -546,6 +627,8 @@ def import_excel(
                 insert_rb_chunk(chunks, record_prefix, record, field_number, formatted)
                 imported_values += 1
 
+    if SEPARATI:
+        remove_preexisting_rb_chunks(modules, record_prefix)
     lines = repack_c_modules(lines, modules)
     with output_path.open("w", encoding="ascii", newline="") as file:
         file.writelines(lines)
@@ -630,6 +713,8 @@ def import_csv(
 
                 if chunk_index is not None:
                     previous = chunks[chunk_index]["value"]
+                    if SEPARATI:
+                        chunks[chunk_index]["source_line"] = 0
                     formatted = (
                         previous
                         if is_numeric_field(previous) and has_same_numeric_value(raw_value, previous)
@@ -643,6 +728,8 @@ def import_csv(
                     insert_rb_chunk(chunks, record_prefix, record, field_number, formatted)
                     imported_values += 1
 
+    if SEPARATI:
+        remove_preexisting_rb_chunks(modules, record_prefix)
     lines = repack_c_modules(lines, modules)
     with output_path.open("w", encoding="ascii", newline="") as file:
         file.writelines(lines)
