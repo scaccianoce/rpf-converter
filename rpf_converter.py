@@ -55,6 +55,13 @@ def validate_reader_settings(record_prefix: str, field_width: int = FIELD_WIDTH)
     return record_prefix, field_width
 
 
+def validate_sheet_name(sheet_name: str) -> str:
+    sheet_name = sheet_name.strip()
+    if not sheet_name:
+        raise RpfError("Il nome del foglio Excel non puo' essere vuoto.")
+    return sheet_name
+
+
 C_PAYLOAD_START = 89
 C_PAYLOAD_END = 1889
 C_PAYLOAD_LENGTH = C_PAYLOAD_END - C_PAYLOAD_START
@@ -534,8 +541,10 @@ def import_excel(
     record_prefix: str = DEFAULT_RECORD_PREFIX,
     field_width: int = FIELD_WIDTH,
     max_field: int = DEFAULT_MAX_IMPORT_FIELD,
+    sheet_name: str = SHEET_NAME,
 ) -> int:
     record_prefix, field_width = validate_reader_settings(record_prefix, field_width)
+    sheet_name = validate_sheet_name(sheet_name)
     if field_width != FIELD_WIDTH:
         raise RpfError("Per il formato RPF dei record C la lunghezza campo deve essere 16.")
     if not 1 <= max_field <= MAX_FIELD_NUMBER:
@@ -546,9 +555,9 @@ def import_excel(
     modules = parse_c_modules(lines)
 
     workbook = load_workbook(excel_path, data_only=False)
-    if SHEET_NAME not in workbook.sheetnames:
-        raise RpfError(f"Il file Excel deve contenere il foglio '{SHEET_NAME}'.")
-    sheet = workbook[SHEET_NAME]
+    if sheet_name not in workbook.sheetnames:
+        raise RpfError(f"Il file Excel deve contenere il foglio '{sheet_name}'.")
+    sheet = workbook[sheet_name]
     header_names = {str(cell.value).strip() for cell in sheet[1] if cell.value is not None}
     metadata = import_metadata_columns_from_names(header_names, record_prefix)
     columns = required_column_indexes(sheet, (*metadata, *fields_columns))
@@ -746,6 +755,7 @@ class Application(tk.Tk):
 
         self.record_prefix = tk.StringVar(value=DEFAULT_RECORD_PREFIX)
         self.field_width = tk.StringVar(value=str(FIELD_WIDTH))
+        self.sheet_name = tk.StringVar(value=SHEET_NAME)
 
         tk.Label(frame, text="Convertitore RPF - Excel e CSV", font=("Arial", 16, "bold")).pack(pady=(0, 12))
         tk.Label(
@@ -765,6 +775,10 @@ class Application(tk.Tk):
         tk.Entry(settings, textvariable=self.record_prefix, width=6).grid(row=0, column=1, padx=(8, 20))
         tk.Label(settings, text="Lunghezza campo:").grid(row=0, column=2, sticky="w")
         tk.Entry(settings, textvariable=self.field_width, width=6).grid(row=0, column=3, padx=(8, 0))
+        tk.Label(settings, text="Foglio Excel:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        tk.Entry(settings, textvariable=self.sheet_name, width=24).grid(
+            row=1, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(8, 0)
+        )
 
         tk.Button(frame, text="1. Esporta RPF in Excel", width=32, command=self.export).pack(pady=4)
         tk.Button(frame, text="2. Importa Excel in RPF", width=32, command=self.import_changes).pack(pady=4)
@@ -829,6 +843,11 @@ class Application(tk.Tk):
         settings = self.reader_settings()
         if settings is None:
             return
+        try:
+            sheet_name = validate_sheet_name(self.sheet_name.get())
+        except RpfError as error:
+            messagebox.showerror("Configurazione non valida", str(error))
+            return
         max_field = self.ask_max_field()
         if max_field is None:
             return
@@ -842,7 +861,9 @@ class Application(tk.Tk):
         if not destination:
             return
         try:
-            count = import_excel(Path(source), Path(excel), Path(destination), *settings, max_field)
+            count = import_excel(
+                Path(source), Path(excel), Path(destination), *settings, max_field, sheet_name
+            )
             messagebox.showinfo(
                 "Importazione completata",
                 f"Aggiornati {count} campi (da {settings[0]}001 a {settings[0]}{max_field:03d}).\n"
@@ -901,6 +922,10 @@ def main() -> int:
         "--max-field", type=int, default=DEFAULT_MAX_IMPORT_FIELD, metavar="N",
         help="Importa solo i campi da 001 fino a N (1-20, predefinito 12); i record RB010 e RB011 sono sempre esclusi",
     )
+    import_parser.add_argument(
+        "--sheet-name", default=SHEET_NAME, metavar="NOME",
+        help="Nome del foglio Excel da importare (predefinito: Campi RPF)",
+    )
 
     export_csv_parser = subparsers.add_parser("export-csv", help="Esporta un RPF in CSV")
     export_csv_parser.add_argument("rpf", type=Path)
@@ -923,7 +948,9 @@ def main() -> int:
         if args.command == "export":
             print(f"Esportati {export_excel(args.rpf, args.excel, args.prefix, args.field_width)} record.")
         elif args.command == "import":
-            print(f"Aggiornati {import_excel(args.rpf, args.excel, args.output, args.prefix, args.field_width, args.max_field)} campi.")
+            print(
+                f"Aggiornati {import_excel(args.rpf, args.excel, args.output, args.prefix, args.field_width, args.max_field, args.sheet_name)} campi."
+            )
         elif args.command == "export-csv":
             print(f"Esportati {export_csv(args.rpf, args.csv, args.prefix, args.field_width)} record.")
         elif args.command == "import-csv":
