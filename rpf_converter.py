@@ -19,6 +19,7 @@ DEFAULT_RECORD_PREFIX = "RB"
 SHEET_NAME = "Campi RPF"
 MAX_FIELD_NUMBER = 20
 DEFAULT_MAX_IMPORT_FIELD = 12
+DEFAULT_RECORDS_PER_C = 9
 NON_IMPORTABLE_RECORDS = frozenset({10, 11})
 # Se True, i campi aggiunti in importazione vengono scritti in nuovi record C.
 SEPARATI = True
@@ -60,6 +61,18 @@ def validate_sheet_name(sheet_name: str) -> str:
     if not sheet_name:
         raise RpfError("Il nome del foglio Excel non puo' essere vuoto.")
     return sheet_name
+
+
+def validate_records_per_c(value: int) -> int:
+    if not 1 <= value <= 999:
+        raise RpfError("I record RB per rigo C devono essere compresi tra 1 e 999.")
+    return value
+
+
+def validate_max_import_field(value: int) -> int:
+    if not 1 <= value <= MAX_FIELD_NUMBER:
+        raise RpfError("L'ultimo campo RB da importare deve essere compreso tra 1 e 20.")
+    return value
 
 
 C_PAYLOAD_START = 89
@@ -440,16 +453,17 @@ def export_excel(
     instructions["A1"].font = Font(bold=True, size=14)
     instructions["A3"] = (
         f"Modificare soltanto le colonne da {record_prefix}001 a "
-        f"{record_prefix}{MAX_FIELD_NUMBER:03d}. Le colonne Modulo, Riga file e Record "
-        f"{record_prefix} identificano la posizione originale e non devono essere modificate."
+        f"{record_prefix}{MAX_FIELD_NUMBER:03d}. L'ultimo campo importato si imposta nell'applicazione "
+        "(predefinito 12). Le colonne Modulo, Riga file e Record "
+        f"{record_prefix} sono informative e vengono ignorate in importazione."
     )
     instructions["A4"] = (
-        f"Ogni valore occupa {field_width} caratteri nel file RPF. Non aggiungere o eliminare righe. "
-        "Se un campo non e presente nel RPF di destinazione ma contiene un valore nel file importato, viene aggiunto automaticamente."
+        f"Ogni valore occupa {field_width} caratteri nel file RPF. In importazione, le righe con almeno "
+        "un campo RB valorizzato vengono numerate in sequenza; il numero di record RB per gruppo si imposta nell'applicazione."
     )
     instructions["A5"] = (
-        f"In importazione i record {record_prefix}010 e {record_prefix}011 non vengono mai modificati: "
-        "sono considerati campi di calcolo e restano quelli del file RPF originale."
+        f"I campi {record_prefix} vuoti, inclusi quelli restituiti come \"\" dalle formule, "
+        "non vengono inseriti nel file RPF."
     )
     instructions.column_dimensions["A"].width = 120
 
@@ -534,111 +548,133 @@ def format_new_field_value(value: object, field_width: int) -> str:
         return " " * field_width
     return text.rjust(field_width) if NUMERIC_VALUE.fullmatch(text) else text.ljust(field_width)
 
+
+def remove_rb_chunks(modules: dict[int, dict[str, object]]) -> None:
+    for info in modules.values():
+        chunks = info["chunks"]
+        chunks[:] = [chunk for chunk in chunks if not str(chunk["code"]).startswith(DEFAULT_RECORD_PREFIX)]
+
+
+def excel_rb_column_indexes(sheet, max_field: int) -> dict[int, int]:
+    columns: dict[int, int] = {}
+    for cell in sheet[1]:
+        if cell.value is None:
+            continue
+        match = re.fullmatch(r"RB(?P<field>\d{3})", str(cell.value).strip().upper())
+        if match and 1 <= (field := int(match["field"])) <= max_field:
+            columns[field] = cell.column
+    if not columns:
+        raise RpfError(
+            f"Nel foglio deve essere presente almeno una colonna da RB001 a RB{max_field:03d}."
+        )
+    return columns
+
+
+def excel_rb_rows(sheet, max_field: int) -> list[list[tuple[int, object]]]:
+    columns = excel_rb_column_indexes(sheet, max_field)
+    rows: list[list[tuple[int, object]]] = []
+    for row_number in range(2, sheet.max_row + 1):
+        fields: list[tuple[int, object]] = []
+        for field_number, column_index in sorted(columns.items()):
+            value = sheet.cell(row_number, column_index).value
+            if value is not None and str(value).strip():
+                fields.append((field_number, value))
+        if fields:
+            rows.append(fields)
+    return rows
+
+
+def make_rb_c_line(
+    template: str,
+    module: int,
+    fields: list[tuple[int, int, object]],
+) -> str:
+    if len(fields) > C_CHUNKS_PER_RECORD:
+        raise RpfError(
+            f"Il modulo {module} contiene {len(fields)} campi valorizzati, "
+            f"ma un record C ne puo' contenere al massimo {C_CHUNKS_PER_RECORD}."
+        )
+    body, _ending = _split_line_ending(template)
+    payload = "".join(
+        f"RB{record:03d}{field_number:03d}{format_new_field_value(value, FIELD_WIDTH)}"
+        for record, field_number, value in fields
+    ).ljust(C_PAYLOAD_LENGTH)
+    return (
+        body[:C_MODULE_START]
+        + f"{module:08d}"
+        + body[C_MODULE_END:C_PAYLOAD_START]
+        + payload
+        + body[C_PAYLOAD_END:]
+        + "\r\n"
+    )
+
+
+def insert_rb_c_lines(lines: list[str], rb_lines: list[str]) -> list[str]:
+    z_indexes = [
+        index for index, line in enumerate(lines)
+        if _split_line_ending(line)[0].startswith("Z")
+    ]
+    if len(z_indexes) != 1:
+        raise RpfError("Il file RPF deve contenere un solo record Z.")
+    z_index = z_indexes[0]
+    rebuilt = [*lines[:z_index], *rb_lines, *lines[z_index:]]
+    z_body, _z_ending = _split_line_ending(rebuilt[z_index + len(rb_lines)])
+    count = sum(_split_line_ending(line)[0].startswith("C") for line in rebuilt)
+    rebuilt[z_index + len(rb_lines)] = (
+        z_body[:Z_C_COUNT_START] + f"{count:09d}" + z_body[Z_C_COUNT_END:] + "\r\n"
+    )
+    return fixed_length_lines(rebuilt)
+
+
 def import_excel(
     rpf_path: Path,
     excel_path: Path,
     output_path: Path,
-    record_prefix: str = DEFAULT_RECORD_PREFIX,
-    field_width: int = FIELD_WIDTH,
-    max_field: int = DEFAULT_MAX_IMPORT_FIELD,
     sheet_name: str = SHEET_NAME,
+    records_per_c: int = DEFAULT_RECORDS_PER_C,
+    max_field: int = DEFAULT_MAX_IMPORT_FIELD,
 ) -> int:
-    record_prefix, field_width = validate_reader_settings(record_prefix, field_width)
     sheet_name = validate_sheet_name(sheet_name)
-    if field_width != FIELD_WIDTH:
-        raise RpfError("Per il formato RPF dei record C la lunghezza campo deve essere 16.")
-    if not 1 <= max_field <= MAX_FIELD_NUMBER:
-        raise RpfError("L'ultimo campo da importare deve essere compreso tra 1 e 20.")
-
-    fields_columns = field_columns(record_prefix)[:max_field]
+    records_per_c = validate_records_per_c(records_per_c)
+    max_field = validate_max_import_field(max_field)
     lines = read_rpf(rpf_path)
     modules = parse_c_modules(lines)
 
-    workbook = load_workbook(excel_path, data_only=False)
+    workbook = load_workbook(excel_path, data_only=True)
     if sheet_name not in workbook.sheetnames:
         raise RpfError(f"Il file Excel deve contenere il foglio '{sheet_name}'.")
     sheet = workbook[sheet_name]
-    header_names = {str(cell.value).strip() for cell in sheet[1] if cell.value is not None}
-    metadata = import_metadata_columns_from_names(header_names, record_prefix)
-    columns = required_column_indexes(sheet, (*metadata, *fields_columns))
+    rows = excel_rb_rows(sheet, max_field)
+    if not rows:
+        raise RpfError("Nel foglio Excel non sono presenti campi RB valorizzati.")
 
-    seen_records: set[tuple[int, int]] = set()
-    imported_values = 0
-
-    for row_number in range(2, sheet.max_row + 1):
-        identifiers = [sheet.cell(row_number, columns[column]).value for column in metadata]
-        if all(value is None for value in identifiers):
-            continue
-        if any(value is None for value in identifiers):
-            raise RpfError(f"Identificativi incompleti nella riga Excel {row_number}.")
-
-        try:
-            module = int(identifiers[0])
-            _informative_line = int(identifiers[1])
-            record = int(identifiers[2])
-        except (TypeError, ValueError) as error:
-            raise RpfError(f"Identificativi non validi nella riga Excel {row_number}.") from error
-
-        # Questi record sono risultati di calcolo: non vengono mai importati.
-        if record in NON_IMPORTABLE_RECORDS:
-            continue
-
-        record_key = (module, record)
-        if record_key in seen_records:
-            raise RpfError(f"Il record nella riga Excel {row_number} e duplicato.")
-        seen_records.add(record_key)
-
-        module_info = modules.get(module)
-        if module_info is None:
-            raise RpfError(f"Il Modulo {module} non esiste nel file RPF di destinazione.")
-        chunks = module_info["chunks"]
-        rb_index, target_records = annotate_rb_chunks(chunks, record_prefix)
-        if record not in target_records:
-            if any(
-                sheet.cell(row_number, columns[column]).value is not None
-                and str(sheet.cell(row_number, columns[column]).value).strip()
-                for column in fields_columns
-            ):
-                raise RpfError(
-                    f"Il record {record_prefix}{record:03d} del Modulo {module} "
-                    f"(riga Excel {row_number}) non esiste nel file RPF di destinazione."
-                )
-            continue
-
-        for field_number, column_name in enumerate(fields_columns, start=1):
-            cell_value = sheet.cell(row_number, columns[column_name]).value
-            has_value = cell_value is not None and str(cell_value).strip() != ""
-
-            rb_index, _target_records = annotate_rb_chunks(chunks, record_prefix)
-            chunk_index = rb_index.get((record, field_number))
-
-            if not has_value:
-                if chunk_index is not None:
-                    del chunks[chunk_index]
-                    imported_values += 1
-                continue
-
-            new_text = value_for_rpf(cell_value)
-            if chunk_index is not None:
-                previous = chunks[chunk_index]["value"]
-                if SEPARATI:
-                    chunks[chunk_index]["source_line"] = 0
-                formatted = (
-                    previous
-                    if is_numeric_field(previous) and has_same_numeric_value(new_text, previous)
-                    else align_value(new_text, previous, field_width)
-                )
-                if formatted != previous:
-                    chunks[chunk_index]["value"] = formatted
-                    imported_values += 1
-            else:
-                formatted = format_new_field_value(cell_value, field_width)
-                insert_rb_chunk(chunks, record_prefix, record, field_number, formatted)
-                imported_values += 1
-
-    if SEPARATI:
-        remove_preexisting_rb_chunks(modules, record_prefix)
+    template = next(
+        template
+        for info in modules.values()
+        for template in info["templates"]
+    )
+    remove_rb_chunks(modules)
     lines = repack_c_modules(lines, modules)
+
+    rb_lines: list[str] = []
+    imported_values = 0
+    for module, start in enumerate(range(0, len(rows), records_per_c), start=1):
+        fields = [
+            (record, field_number, value)
+            for record, row in enumerate(rows[start:start + records_per_c], start=1)
+            for field_number, value in row
+        ]
+        for field_start in range(0, len(fields), C_CHUNKS_PER_RECORD):
+            rb_lines.append(
+                make_rb_c_line(
+                    template[0] + template[1],
+                    module,
+                    fields[field_start:field_start + C_CHUNKS_PER_RECORD],
+                )
+            )
+        imported_values += len(fields)
+
+    lines = insert_rb_c_lines(lines, rb_lines)
     with output_path.open("w", encoding="ascii", newline="") as file:
         file.writelines(lines)
     return imported_values
@@ -753,17 +789,16 @@ class Application(tk.Tk):
         frame = tk.Frame(self, padx=24, pady=24)
         frame.pack()
 
-        self.record_prefix = tk.StringVar(value=DEFAULT_RECORD_PREFIX)
-        self.field_width = tk.StringVar(value=str(FIELD_WIDTH))
-        self.sheet_name = tk.StringVar(value=SHEET_NAME)
+        self.records_per_c = tk.StringVar(value=str(DEFAULT_RECORDS_PER_C))
+        self.max_field = tk.StringVar(value=str(DEFAULT_MAX_IMPORT_FIELD))
 
         tk.Label(frame, text="Convertitore RPF - Excel e CSV", font=("Arial", 16, "bold")).pack(pady=(0, 12))
         tk.Label(
             frame,
             text=(
                 "Esporta i campi RPF in Excel o CSV e riporta le modifiche nel file originale.\n"
-                "Ogni riga fisica contenente record del prefisso selezionato viene trattata come un modulo.\n"
-                "I record RB010 e RB011 sono esclusi dall'importazione."
+                "L'importazione ricrea i record C contenenti RB in sequenza dal foglio Excel selezionato.\n"
+                "Vengono inseriti soltanto i campi RB valorizzati."
             ),
             wraplength=520,
             justify="center",
@@ -771,13 +806,11 @@ class Application(tk.Tk):
 
         settings = tk.LabelFrame(frame, text="Lettura record", padx=10, pady=8)
         settings.pack(fill="x", pady=(0, 14))
-        tk.Label(settings, text="Prefisso (2 lettere):").grid(row=0, column=0, sticky="w")
-        tk.Entry(settings, textvariable=self.record_prefix, width=6).grid(row=0, column=1, padx=(8, 20))
-        tk.Label(settings, text="Lunghezza campo:").grid(row=0, column=2, sticky="w")
-        tk.Entry(settings, textvariable=self.field_width, width=6).grid(row=0, column=3, padx=(8, 0))
-        tk.Label(settings, text="Foglio Excel:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        tk.Entry(settings, textvariable=self.sheet_name, width=24).grid(
-            row=1, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(8, 0)
+        tk.Label(settings, text="Ultimo campo RB da importare:").grid(row=0, column=0, sticky="w")
+        tk.Entry(settings, textvariable=self.max_field, width=6).grid(row=0, column=1, padx=(8, 0), sticky="w")
+        tk.Label(settings, text="Record RB per rigo C:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        tk.Entry(settings, textvariable=self.records_per_c, width=6).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0)
         )
 
         tk.Button(frame, text="1. Esporta RPF in Excel", width=32, command=self.export).pack(pady=4)
@@ -786,13 +819,7 @@ class Application(tk.Tk):
         tk.Button(frame, text="4. Importa CSV in RPF", width=32, command=self.import_csv_action).pack(pady=4)
 
     def reader_settings(self) -> tuple[str, int] | None:
-        try:
-            return validate_reader_settings(self.record_prefix.get(), int(self.field_width.get()))
-        except ValueError:
-            messagebox.showerror("Configurazione non valida", "La lunghezza del campo deve essere un numero intero positivo.")
-        except RpfError as error:
-            messagebox.showerror("Configurazione non valida", str(error))
-        return None
+        return DEFAULT_RECORD_PREFIX, FIELD_WIDTH
 
     def ask_max_field(self) -> int | None:
         return simpledialog.askinteger(
@@ -806,6 +833,45 @@ class Application(tk.Tk):
             minvalue=1,
             maxvalue=20,
         )
+
+    def select_excel_sheet(self, excel_path: Path) -> str | None:
+        workbook = load_workbook(excel_path, read_only=True)
+        try:
+            sheet_names = workbook.sheetnames
+        finally:
+            workbook.close()
+        if not sheet_names:
+            raise RpfError("Il file Excel non contiene fogli.")
+        if len(sheet_names) == 1:
+            return sheet_names[0]
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Seleziona il foglio Excel")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        selection = tk.StringVar(value=sheet_names[0])
+        result: dict[str, str | None] = {"sheet_name": None}
+        frame = tk.Frame(dialog, padx=20, pady=16)
+        frame.pack()
+        tk.Label(frame, text="Foglio da importare:").pack(anchor="w")
+        tk.OptionMenu(frame, selection, *sheet_names).pack(fill="x", pady=(6, 14))
+
+        def confirm() -> None:
+            result["sheet_name"] = selection.get()
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        buttons = tk.Frame(frame)
+        buttons.pack()
+        tk.Button(buttons, text="Annulla", width=10, command=cancel).pack(side="left", padx=4)
+        tk.Button(buttons, text="Usa foglio", width=10, command=confirm).pack(side="left", padx=4)
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        self.wait_window(dialog)
+        return result["sheet_name"]
 
     def export(self) -> None:
         settings = self.reader_settings()
@@ -840,16 +906,17 @@ class Application(tk.Tk):
             messagebox.showerror("Esportazione non riuscita", str(error))
 
     def import_changes(self) -> None:
-        settings = self.reader_settings()
-        if settings is None:
-            return
         try:
-            sheet_name = validate_sheet_name(self.sheet_name.get())
+            records_per_c = validate_records_per_c(int(self.records_per_c.get()))
+            max_field = validate_max_import_field(int(self.max_field.get()))
+        except ValueError:
+            messagebox.showerror(
+                "Configurazione non valida",
+                "I valori devono essere numeri interi: ultimo campo da 1 a 20 e record RB per rigo C da 1 a 999.",
+            )
+            return
         except RpfError as error:
             messagebox.showerror("Configurazione non valida", str(error))
-            return
-        max_field = self.ask_max_field()
-        if max_field is None:
             return
         source = filedialog.askopenfilename(title="Seleziona il file RPF originale", filetypes=[("File RPF", "*.rpf"), ("Tutti i file", "*.*")])
         if not source:
@@ -857,17 +924,23 @@ class Application(tk.Tk):
         excel = filedialog.askopenfilename(title="Seleziona il file Excel modificato", filetypes=[("File Excel", "*.xlsx")])
         if not excel:
             return
+        try:
+            sheet_name = self.select_excel_sheet(Path(excel))
+        except (OSError, RpfError) as error:
+            messagebox.showerror("Selezione foglio non riuscita", str(error))
+            return
+        if sheet_name is None:
+            return
         destination = filedialog.asksaveasfilename(title="Salva il file RPF modificato", defaultextension=".rpf", filetypes=[("File RPF", "*.rpf")])
         if not destination:
             return
         try:
             count = import_excel(
-                Path(source), Path(excel), Path(destination), *settings, max_field, sheet_name
+                Path(source), Path(excel), Path(destination), sheet_name, records_per_c, max_field
             )
             messagebox.showinfo(
                 "Importazione completata",
-                f"Aggiornati {count} campi (da {settings[0]}001 a {settings[0]}{max_field:03d}).\n"
-                f"I record {settings[0]}010 e {settings[0]}011 sono stati esclusi.",
+                f"Creati {count} campi RB nei nuovi record C.",
             )
         except (OSError, RpfError) as error:
             messagebox.showerror("Importazione non riuscita", str(error))
@@ -917,10 +990,13 @@ def main() -> int:
     import_parser.add_argument("rpf", type=Path)
     import_parser.add_argument("excel", type=Path)
     import_parser.add_argument("output", type=Path)
-    add_common_options(import_parser)
+    import_parser.add_argument(
+        "--records-per-c", type=int, default=DEFAULT_RECORDS_PER_C, metavar="N",
+        help="Numero di righe Excel per record C (1-999, predefinito 9)",
+    )
     import_parser.add_argument(
         "--max-field", type=int, default=DEFAULT_MAX_IMPORT_FIELD, metavar="N",
-        help="Importa solo i campi da 001 fino a N (1-20, predefinito 12); i record RB010 e RB011 sono sempre esclusi",
+        help="Legge le colonne da RB001 fino a RBNNN (1-20, predefinito 12)",
     )
     import_parser.add_argument(
         "--sheet-name", default=SHEET_NAME, metavar="NOME",
@@ -949,7 +1025,7 @@ def main() -> int:
             print(f"Esportati {export_excel(args.rpf, args.excel, args.prefix, args.field_width)} record.")
         elif args.command == "import":
             print(
-                f"Aggiornati {import_excel(args.rpf, args.excel, args.output, args.prefix, args.field_width, args.max_field, args.sheet_name)} campi."
+                f"Creati {import_excel(args.rpf, args.excel, args.output, args.sheet_name, args.records_per_c, args.max_field)} campi RB."
             )
         elif args.command == "export-csv":
             print(f"Esportati {export_csv(args.rpf, args.csv, args.prefix, args.field_width)} record.")
